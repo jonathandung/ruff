@@ -3048,6 +3048,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let db = self.db();
 
         match object_ty {
+            Type::Recursive(recursive) => recursive.map_or(db, env, true, |unfolded| {
+                self.validate_attribute_deletion(target, unfolded, attribute, emit_diagnostics)
+            }),
+            Type::RecursiveVar(_) => {
+                unreachable!("semantic operation on an unbound recursive variable")
+            }
             Type::Union(union) => {
                 for element_ty in union.elements(db) {
                     if !self.validate_attribute_deletion(
@@ -5090,7 +5096,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         // Resolve the target type, assuming a load context.
         let target_result = match &**target {
             ast::Expr::Name(name) => {
-                let previous_value = self.infer_name_load(name);
+                let (previous_value, _) = self.infer_name_load(name);
                 self.store_expression_type(target, previous_value);
                 Ok(previous_value)
             }
@@ -5502,6 +5508,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             kind: CallableTypeKind,
         ) -> Option<Type<'d>> {
             match ty {
+                Type::Recursive(recursive) => recursive.map_or(db, env, None, |unfolded| {
+                    propagate_callable_kind(db, env, unfolded, kind)
+                }),
+                Type::RecursiveVar(_) => {
+                    unreachable!("semantic operation on an unbound recursive variable")
+                }
                 Type::Callable(callable) => Some(Type::Callable(callable.with_kind(db, kind))),
                 Type::Union(union) => union.try_map(db, env, |element| {
                     propagate_callable_kind(db, env, *element, kind)
@@ -6640,6 +6652,16 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             }
         };
 
+        self.finish_expression_type(expression, ty, tcx)
+    }
+
+    /// Apply context before recording an inferred expression type.
+    fn finish_expression_type(
+        &mut self,
+        expression: &ast::Expr,
+        ty: Type<'db>,
+        tcx: TypeContext<'db>,
+    ) -> Type<'db> {
         let ty = self.apply_type_context(expression, ty, tcx);
         self.store_expression_type(expression, ty);
         ty
@@ -10297,11 +10319,19 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         );
     }
 
-    fn infer_name_load(&mut self, name_node: &ast::ExprName) -> Type<'db> {
+    /// Resolve a name once, retaining its definition for type-alias interpretation.
+    fn infer_name_load(
+        &mut self,
+        name_node: &ast::ExprName,
+    ) -> (Type<'db>, Option<Definition<'db>>) {
         let db = self.db();
         let expr = PlaceExpr::from_expr_name(name_node);
 
         let (resolved, _) = self.infer_place_load(expr, ast::ExprRef::Name(name_node));
+        let definition = match resolved.place {
+            Place::Defined(place) => place.provenance.definition(),
+            Place::Undefined => None,
+        };
         let env = self.program_environment();
 
         let ty = resolved.unwrap_with_diagnostic(db, env, |lookup_error| match lookup_error {
@@ -10315,7 +10345,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             }
         });
 
-        ty.inner_type()
+        (ty.inner_type(), definition)
     }
 
     /// Infer the type of a place expression from its ordered load sources.
@@ -10626,7 +10656,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
     fn infer_name_expression(&mut self, name: &ast::ExprName) -> Type<'db> {
         match name.ctx {
-            ExprContext::Load => self.infer_name_load(name),
+            ExprContext::Load => self.infer_name_load(name).0,
             ExprContext::Store => Type::Never,
             ExprContext::Del => {
                 self.infer_name_load(name);
@@ -11184,6 +11214,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         };
 
         match (op, operand_type) {
+            (_, Type::RecursiveVar(_)) => {
+                unreachable!("semantic operation on an unbound recursive variable")
+            }
             (ast::UnaryOp::Invert | ast::UnaryOp::UAdd | ast::UnaryOp::USub, Type::Dynamic(_))
             | (_, Type::Divergent(_)) => operand_type,
             (_, Type::Never) => Type::Never,
@@ -11254,6 +11287,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
                 Type::from_truthiness(db, env, original_truthiness.negate())
             }
+            (_, Type::Recursive(_)) => fallback_unary_expression_type(),
             // Handle constrained TypeVars specially: check each constraint individually.
             //
             // TODO: We expect to replace this with more general support once we migrate to the new
