@@ -68,8 +68,8 @@ use crate::types::visitor::{
     walk_type_with_recursion_guard,
 };
 use crate::types::{
-    BindingContext, BoundMethodType, BoundTypeVarInstance, CallableType, CallableTypes,
-    ClassLiteral, DATACLASS_FLAGS, DataclassFlags, DataclassParams, DynamicType, GenericAlias,
+    BindingContext, BoundTypeVarInstance, CallableType, CallableTypes, ClassLiteral,
+    DATACLASS_FLAGS, DataclassFlags, DataclassParams, DynamicType, GenericAlias,
     InternedConstraintSet, IntersectionType, KnownBoundMethodType, KnownClass, KnownInstanceType,
     LiteralValueTypeKind, NominalInstanceType, PropertyInstanceType, SpecialFormType, TypeContext,
     TypeMapping, TypeVarBoundOrConstraints, TypeVarVariance, UnionAccumulator, UnionBuilder,
@@ -1665,81 +1665,28 @@ impl<'db> Bindings<'db> {
                     Type::KnownBoundMethod(KnownBoundMethodType::FunctionTypeDunderGet(
                         function,
                     )) => {
-                        if function.is_classmethod(db) {
-                            match overload.parameter_types() {
-                                [_, Some(owner)] => {
-                                    overload.set_return_type(Type::BoundMethod(
-                                        BoundMethodType::new(db, function, *owner, *owner),
-                                    ));
-                                }
-                                [Some(instance), None] => {
-                                    overload.set_return_type(Type::BoundMethod(
-                                        BoundMethodType::new(
-                                            db,
-                                            function,
-                                            instance.to_meta_type(db, env),
-                                            instance.to_meta_type(db, env),
-                                        ),
-                                    ));
-                                }
-                                _ => {}
-                            }
-                        } else if function.is_staticmethod(db) {
-                            overload.set_return_type(Type::FunctionLiteral(function));
-                        } else if let [Some(first), _] = overload.parameter_types() {
-                            if first.is_none(db) {
-                                overload.set_return_type(Type::FunctionLiteral(function));
-                            } else {
-                                overload.set_return_type(Type::BoundMethod(BoundMethodType::new(
-                                    db, function, *first, *first,
-                                )));
-                            }
+                        if let [Some(instance), owner] = overload.parameter_types()
+                            && let Some(result) = function.inner(db).function_like_descriptor_get(
+                                db,
+                                env,
+                                (!instance.is_none(db)).then_some(*instance),
+                                *owner,
+                            )
+                        {
+                            overload.set_return_type(result);
                         }
                     }
 
                     Type::WrapperDescriptor(WrapperDescriptorKind::FunctionTypeDunderGet) => {
-                        if let [Some(function_ty @ Type::FunctionLiteral(function)), ..] =
-                            overload.parameter_types()
+                        if let [Some(function), Some(instance), owner] = overload.parameter_types()
+                            && let Some(result) = function.function_like_descriptor_get(
+                                db,
+                                env,
+                                (!instance.is_none(db)).then_some(*instance),
+                                *owner,
+                            )
                         {
-                            if function.is_classmethod(db) {
-                                match overload.parameter_types() {
-                                    [_, _, Some(owner)] => {
-                                        overload.set_return_type(Type::BoundMethod(
-                                            BoundMethodType::new(db, *function, *owner, *owner),
-                                        ));
-                                    }
-
-                                    [_, Some(instance), None] => {
-                                        overload.set_return_type(Type::BoundMethod(
-                                            BoundMethodType::new(
-                                                db,
-                                                *function,
-                                                instance.to_meta_type(db, env),
-                                                instance.to_meta_type(db, env),
-                                            ),
-                                        ));
-                                    }
-
-                                    _ => {}
-                                }
-                            } else if function.is_staticmethod(db) {
-                                overload.set_return_type(*function_ty);
-                            } else {
-                                match overload.parameter_types() {
-                                    [_, Some(instance), _] if instance.is_none(db) => {
-                                        overload.set_return_type(*function_ty);
-                                    }
-                                    [_, Some(instance), _] => {
-                                        overload.set_return_type(Type::BoundMethod(
-                                            BoundMethodType::new(
-                                                db, *function, *instance, *instance,
-                                            ),
-                                        ));
-                                    }
-
-                                    _ => {}
-                                }
-                            }
+                            overload.set_return_type(result);
                         }
                     }
 
@@ -1980,9 +1927,10 @@ impl<'db> Bindings<'db> {
                     Type::BoundMethod(bound_method)
                         if let Type::PropertyInstance(property) =
                             bound_method.self_instance(db)
-                            && is_property_method(db, env, bound_method.function(db)) =>
+                            && let Some(function) = bound_method.function(db)
+                            && is_property_method(db, env, function) =>
                     {
-                        match bound_method.function(db).name(db).as_str() {
+                        match function.name(db).as_str() {
                             "setter" => {
                                 if let [Some(_), Some(setter)] = overload.parameter_types() {
                                     overload.set_return_type(Type::PropertyInstance(
@@ -2352,7 +2300,7 @@ impl<'db> Bindings<'db> {
                                     }
 
                                     Type::BoundMethod(bound_method) => signature_generic_context(
-                                        bound_method.function(db).signature(db),
+                                        bound_method.unbound_signatures(db),
                                     ),
 
                                     Type::Callable(callable) => {
@@ -4538,12 +4486,19 @@ impl<'db> CallableBinding<'db> {
         &self,
         db: &'db dyn Db,
     ) -> impl Iterator<Item = OverloadLiteral<'db>> + Clone {
-        if let Type::Callable(callable) = self.signature_type {
+        let signature_type = match self.signature_type {
+            Type::BoundMethod(bound)
+            | Type::KnownBoundMethod(KnownBoundMethodType::MethodTypeDunderCall(bound)) => {
+                bound.func(db)
+            }
+            ty => ty,
+        };
+        if let Type::Callable(callable) = signature_type {
             return Either::Left(callable.deprecated(db).into_iter());
         }
-        let function = match self.signature_type {
+        let function = match signature_type {
             Type::FunctionLiteral(function) => Some(function),
-            Type::BoundMethod(bound) => Some(bound.function(db)),
+            Type::BoundMethod(bound) => bound.function(db),
             _ => None,
         };
         let (overloads, implementation) = function
@@ -4679,13 +4634,15 @@ impl<'db> CallableBinding<'db> {
                 // [1]: https://github.com/astral-sh/ty/issues/274#issuecomment-2881856028
                 let function_type_and_kind = match self.signature_type {
                     Type::FunctionLiteral(function) => Some((FunctionKind::Function, function)),
-                    Type::BoundMethod(bound_method) => Some((
-                        FunctionKind::BoundMethod,
-                        bound_method.function(context.db()),
-                    )),
+                    Type::BoundMethod(bound_method) => bound_method
+                        .function(context.db())
+                        .map(|function| (FunctionKind::BoundMethod, function)),
                     Type::KnownBoundMethod(KnownBoundMethodType::FunctionTypeDunderGet(
                         function,
-                    )) => Some((FunctionKind::MethodWrapper, function)),
+                    )) => function
+                        .inner(db)
+                        .as_function_literal()
+                        .map(|function| (FunctionKind::MethodWrapper, function)),
                     _ => None,
                 };
 
@@ -5953,7 +5910,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                         let callable = argument_bindings.single_item()?.callable();
                         let (function, is_bound_method) = match callable.signature_type {
                             Type::FunctionLiteral(function) => (function, false),
-                            Type::BoundMethod(method) => (method.function(db), true),
+                            Type::BoundMethod(method) => (method.function(db)?, true),
                             _ => return None,
                         };
                         let source_binding = callable
@@ -8587,7 +8544,7 @@ impl<'db> CallableDescription<'db> {
     ) -> Option<ClassLiteral<'db>> {
         let function = match callable_type {
             Type::FunctionLiteral(function) => function,
-            Type::BoundMethod(method) => method.function(db),
+            Type::BoundMethod(method) => method.function(db)?,
             Type::ClassLiteral(class) => return Some(class),
             _ => return None,
         };
@@ -8665,7 +8622,7 @@ impl<'db> CallableDescription<'db> {
                 })
             }
             Type::BoundMethod(bound_method) => Some({
-                let function = bound_method.function(db);
+                let function = bound_method.function(db)?;
                 let kind = if function.name(db) == "__init__" {
                     None
                 } else {
@@ -8677,9 +8634,15 @@ impl<'db> CallableDescription<'db> {
                 }
             }),
             Type::KnownBoundMethod(KnownBoundMethodType::FunctionTypeDunderGet(function)) => {
-                Some(CallableDescription {
-                    kind: Some("method wrapper `__get__` of function"),
-                    name: Cow::Borrowed(function.name(db)),
+                Some(match function.inner(db).as_function_literal() {
+                    Some(function) => CallableDescription {
+                        kind: Some("method wrapper `__get__` of function"),
+                        name: Cow::Borrowed(function.name(db)),
+                    },
+                    None => CallableDescription {
+                        kind: Some("method wrapper"),
+                        name: Cow::Borrowed("__get__"),
+                    },
                 })
             }
             Type::KnownBoundMethod(KnownBoundMethodType::PropertyDunderGet(_)) => {

@@ -1442,9 +1442,9 @@ impl<'db> ClassType<'db> {
         ) -> Option<AbstractMethodKind> {
             match ty {
                 Type::FunctionLiteral(function) => function.as_abstract_method(db, defining_class),
-                Type::BoundMethod(method) => {
-                    method.function(db).as_abstract_method(db, defining_class)
-                }
+                Type::BoundMethod(method) => method
+                    .function(db)
+                    .and_then(|function| function.as_abstract_method(db, defining_class)),
                 Type::PropertyInstance(property) => {
                     // A property is abstract if any of its accessors is abstract.
                     property

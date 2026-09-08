@@ -216,11 +216,11 @@ impl TypeRelation {
         matches!(self, TypeRelation::Subtyping)
     }
 
-    const fn can_safely_assume_reflexivity(self, ty: Type) -> bool {
+    fn can_safely_assume_reflexivity<'db>(self, db: &'db dyn Db, ty: Type<'db>) -> bool {
         match self {
             TypeRelation::Assignability | TypeRelation::Redundancy { .. } => true,
             TypeRelation::Subtyping | TypeRelation::SubtypingAssuming => {
-                ty.subtyping_is_always_reflexive()
+                ty.subtyping_is_always_reflexive(db)
             }
         }
     }
@@ -256,15 +256,21 @@ impl<'db> Type<'db> {
     ///
     /// This method may have false negatives, but it should not have false positives. It should be
     /// a cheap shallow check, not an exhaustive recursive check.
-    const fn subtyping_is_always_reflexive(self) -> bool {
+    fn subtyping_is_always_reflexive(self, db: &'db dyn Db) -> bool {
         match self {
+            Type::BoundMethod(method)
+            | Type::KnownBoundMethod(
+                KnownBoundMethodType::MethodTypeDunderGet(method)
+                | KnownBoundMethodType::MethodTypeDunderCall(method),
+            ) => method.function(db).is_some(),
+            Type::KnownBoundMethod(KnownBoundMethodType::FunctionTypeDunderGet(function)) => {
+                function.inner(db).is_function_literal()
+            }
             Type::Never
             | Type::FunctionLiteral(..)
-            | Type::BoundMethod(_)
             | Type::WrapperDescriptor(_)
             | Type::KnownBoundMethod(
-                KnownBoundMethodType::FunctionTypeDunderGet(_)
-                | KnownBoundMethodType::FunctionTypeDunderCall(_)
+                KnownBoundMethodType::FunctionTypeDunderCall(_)
                 | KnownBoundMethodType::StrStartswith(_)
                 | KnownBoundMethodType::ConstraintSetLowerBound
                 | KnownBoundMethodType::ConstraintSetUpperBound
@@ -1648,7 +1654,7 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
         //
         // Note that we could do a full equivalence check here, but that would be both expensive
         // and unnecessary. This early return is only an optimisation.
-        if self.relation.can_safely_assume_reflexivity(source) && source == target {
+        if source == target && self.relation.can_safely_assume_reflexivity(db, source) {
             return self.always();
         }
 
@@ -1937,7 +1943,7 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
             // However, there is one exception to this general rule: for any given typevar `T`,
             // `T` will always be a subtype of any union containing `T`.
             (_, Type::Union(union))
-                if self.relation.can_safely_assume_reflexivity(source)
+                if self.relation.can_safely_assume_reflexivity(db, source)
                     && union.elements(db).contains(&source) =>
             {
                 self.always()
@@ -1945,7 +1951,7 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
 
             // A similar rule applies in reverse to intersection types.
             (Type::Intersection(intersection), _)
-                if self.relation.can_safely_assume_reflexivity(target)
+                if self.relation.can_safely_assume_reflexivity(db, target)
                     && intersection.positive(db).contains(&target) =>
             {
                 self.always()
@@ -1960,7 +1966,7 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
                 self.always()
             }
             (Type::Intersection(intersection), _)
-                if self.relation.can_safely_assume_reflexivity(target)
+                if self.relation.can_safely_assume_reflexivity(db, target)
                     && intersection.negative(db).contains(&target) =>
             {
                 self.never()
@@ -2573,9 +2579,9 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
                 self.check_type_pair(db, KnownClass::Bool.to_instance(db, env), target)
             }
 
-            // Function-like callables are subtypes of `FunctionType`
-            (Type::Callable(callable), _) if callable.is_function_like(db) => {
-                self.check_type_pair(db, KnownClass::FunctionType.to_instance(db, env), target)
+            // A known callable representation also carries its nominal runtime type.
+            (Type::Callable(callable), _) if let Some(class) = callable.runtime_class(db) => {
+                self.check_type_pair(db, class.to_instance(db, env), target)
             }
 
             (Type::Callable(_), _) => self.never(),
@@ -3415,6 +3421,24 @@ impl<'a, 'c, 'db> DisjointnessChecker<'a, 'c, 'db> {
             ) => nontrivial_check(self, || self.check_property_instance_pair(db, left, right)),
 
             (
+                Type::KnownBoundMethod(KnownBoundMethodType::FunctionTypeDunderGet(left)),
+                Type::KnownBoundMethod(KnownBoundMethodType::FunctionTypeDunderGet(right)),
+            ) => nontrivial_check(self, || {
+                self.check_type_pair(db, left.inner(db), right.inner(db))
+            }),
+
+            (
+                Type::KnownBoundMethod(KnownBoundMethodType::MethodTypeDunderGet(left)),
+                Type::KnownBoundMethod(KnownBoundMethodType::MethodTypeDunderGet(right)),
+            )
+            | (
+                Type::KnownBoundMethod(KnownBoundMethodType::MethodTypeDunderCall(left)),
+                Type::KnownBoundMethod(KnownBoundMethodType::MethodTypeDunderCall(right)),
+            ) => nontrivial_check(self, || {
+                self.check_type_pair(db, Type::BoundMethod(left), Type::BoundMethod(right))
+            }),
+
+            (
                 Type::KnownInstance(KnownInstanceType::Sentinel(left_sentinel)),
                 Type::KnownInstance(KnownInstanceType::Sentinel(right_sentinel)),
             ) => ConstraintSet::from_bool(
@@ -3826,14 +3850,31 @@ impl<'a, 'c, 'db> DisjointnessChecker<'a, 'c, 'db> {
                 })
             }
 
-            (Type::FunctionLiteral(..), Type::NominalInstance(instance))
-            | (Type::NominalInstance(instance), Type::FunctionLiteral(..)) => {
-                // A `Type::FunctionLiteral()` must be an instance of exactly `types.FunctionType`
-                // (it cannot be an instance of a `types.FunctionType` subclass)
+            (Type::FunctionLiteral(function), Type::NominalInstance(instance))
+            | (Type::NominalInstance(instance), Type::FunctionLiteral(function)) => {
+                // Function literals and their descriptor wrappers have an exact runtime class.
                 nontrivial_check(self, || {
-                    KnownClass::FunctionType
+                    function
+                        .runtime_class(db)
                         .when_subclass_of(db, env, instance.class(db, env), self.constraints)
                         .negate(db, self.constraints)
+                })
+            }
+
+            (Type::Callable(callable), other) | (other, Type::Callable(callable))
+                if let Some(class) = callable.runtime_class(db) =>
+            {
+                let other = match other {
+                    Type::Callable(other_callable) => {
+                        let Some(other_class) = other_callable.runtime_class(db) else {
+                            return self.never();
+                        };
+                        other_class.to_instance(db, env)
+                    }
+                    _ => other,
+                };
+                nontrivial_check(self, || {
+                    self.check_type_pair(db, class.to_instance(db, env), other)
                 })
             }
 
@@ -3842,7 +3883,9 @@ impl<'a, 'c, 'db> DisjointnessChecker<'a, 'c, 'db> {
             (Type::BoundMethod(a), Type::BoundMethod(b)) => {
                 let a_function = a.function(db);
                 let b_function = b.function(db);
-                if a_function.name(db) != b_function.name(db) {
+                if let (Some(a_function), Some(b_function)) = (a_function, b_function)
+                    && a_function.name(db) != b_function.name(db)
+                {
                     // We typically ask about `BoundMethod` disjointness when we're looking at a
                     // method call on an intersection type like `A & B`. In that case, the same
                     // method name would show up on both sides of this check. However for
@@ -3852,7 +3895,8 @@ impl<'a, 'c, 'db> DisjointnessChecker<'a, 'c, 'db> {
                 }
 
                 nontrivial_check(self, || {
-                    if a_function != b_function
+                    if let (Some(a_function), Some(b_function)) = (a_function, b_function)
+                        && a_function != b_function
                         && a_function.has_known_decorator(db, FunctionDecorators::FINAL)
                         && b_function.has_known_decorator(db, FunctionDecorators::FINAL)
                     {
@@ -3873,8 +3917,8 @@ impl<'a, 'c, 'db> DisjointnessChecker<'a, 'c, 'db> {
                         // ```
                         self.always()
                     } else {
-                        // The names match, so `BoundMethod` disjointness depends on whether the bound
-                        // self types are disjoint. Note that this can produce confusing results in the
+                        // Without distinct function identities, `BoundMethod` disjointness depends on
+                        // whether the bound self types are disjoint. This can produce confusing results in the
                         // face of Liskov violations. For example:
                         // ```
                         // class A:

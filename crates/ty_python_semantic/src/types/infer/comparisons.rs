@@ -13,9 +13,9 @@ use crate::types::equality::{
 };
 use crate::types::tuple::{Tuple, TupleSpec};
 use crate::types::{
-    DynamicType, FunctionType, IntersectionBuilder, IntersectionType, KnownClass,
-    KnownInstanceType, LiteralValueType, LiteralValueTypeKind, MemberLookupPolicy, Type,
-    TypeContext, TypeTransformer, TypeVarBoundOrConstraints, UnionBuilder,
+    DynamicType, IntersectionBuilder, IntersectionType, KnownClass, KnownInstanceType,
+    LiteralValueType, LiteralValueTypeKind, MemberLookupPolicy, Type, TypeContext, TypeTransformer,
+    TypeVarBoundOrConstraints, UnionBuilder,
 };
 use ty_python_core::Truthiness;
 
@@ -67,7 +67,7 @@ impl<'db> Type<'db> {
                     upcast(db, env, newtype.concrete_base_type(db), visitor)
                 }
                 Type::FunctionLiteral(function) => {
-                    Type::FunctionLiteral(FunctionType::new(db, function.literal(db), None))
+                    Type::FunctionLiteral(function.without_updated_signatures(db))
                 }
                 Type::TypeVar(typevar) => visitor.visit_type(db, ty, || {
                     match typevar.typevar(db).bound_or_constraints(db, env) {

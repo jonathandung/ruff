@@ -1013,7 +1013,7 @@ fn method_override_types<'db>(
 ) -> Option<(Type<'db>, Type<'db>)> {
     let (subclass_type, superclass_type) = match (subclass_type, superclass_type) {
         (Type::BoundMethod(subclass_method), Type::BoundMethod(superclass_method)) => {
-            let superclass_signature = superclass_method.function(db).signature(db);
+            let superclass_signature = superclass_method.unbound_signatures(db);
             let explicit_receiver = match superclass_signature.overloads.as_slice() {
                 [signature] => signature
                     .parameters()
@@ -1056,7 +1056,9 @@ fn method_override_types<'db>(
         }
         _ => (subclass_type, superclass_type),
     };
-    let superclass_callable = superclass_type.try_upcast_to_callable(db, env)?;
+    let superclass_callable = superclass_type
+        .try_upcast_to_callable(db, env)?
+        .map(|callable| callable.into_regular(db));
 
     Some((subclass_type, superclass_callable.into_type(db, env)))
 }

@@ -56,7 +56,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         #[derive(Debug)]
         enum FunctionInfo<'db> {
             Function(&'db CallableSignature<'db>, &'db str),
-            Method(&'db CallableSignature<'db>, Cow<'db, str>),
+            Method(&'db CallableSignature<'db>, Option<Cow<'db, str>>),
             Lambda(&'db CallableSignature<'db>),
         }
 
@@ -81,7 +81,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 match self {
                     FunctionInfo::Function(_, name) => write!(f, "Function `{name}`"),
-                    FunctionInfo::Method(_, name) => write!(f, "Method `{name}`"),
+                    FunctionInfo::Method(_, Some(name)) => write!(f, "Method `{name}`"),
+                    FunctionInfo::Method(_, None) => write!(f, "Method object"),
                     FunctionInfo::Lambda(_) => write!(f, "Function object"),
                 }
             }
@@ -212,17 +213,16 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     function.signature(db),
                     function.name(db),
                 )),
-                Type::BoundMethod(method) => {
-                    let function = method.function(db);
-                    Some(FunctionInfo::Method(
-                        method.bound_signatures(db),
+                Type::BoundMethod(method) => Some(FunctionInfo::Method(
+                    method.bound_signatures(db),
+                    method.function(db).map(|function| {
                         CallableDescription::defining_class(db, *test_type)
                             .map(|class| {
                                 Cow::Owned(format!("{}.{}", class.name(db), function.name(db)))
                             })
-                            .unwrap_or(Cow::Borrowed(&**function.name(db))),
-                    ))
-                }
+                            .unwrap_or(Cow::Borrowed(&**function.name(db)))
+                    }),
+                )),
                 Type::Callable(callable) if callable.is_function_like(db) => {
                     Some(FunctionInfo::Lambda(callable.signatures(db)))
                 }
